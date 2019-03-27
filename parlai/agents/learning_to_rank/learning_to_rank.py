@@ -18,11 +18,14 @@ class LearningToRankAgent(Agent):
         # initialize defaults first
         super().__init__(opt, shared)
 
-        if not shared:
+        self.id = 'LearningToRank'
+
+        if shared:
+            raise NotImplementedError
+        else:
             # this is not a shared instance of this class, so do full
             # initialization. if shared is set, only set up shared members.
             self.sess = tf.Session()
-            self.id = 'LearningToRank'
             self.dict = DictionaryAgent(opt)
             self.EOS = self.dict.end_token
             self.observation = {'text': self.EOS, 'episode_done': True}
@@ -61,6 +64,7 @@ class LearningToRankAgent(Agent):
         self.episode_done = True
 
     def batchify(self, observations):
+        assert len(observations) == 1
         """Convert a list of observations into input & target tensors."""
         def valid(obs):
             # check if this is an example our model should actually process
@@ -74,76 +78,52 @@ class LearningToRankAgent(Agent):
             return None, None, None
 
         context_turns = [[] for _ in range(self.learning_to_rank_config['max_context_turns'])]
-        answers = [[] for _ in range(len(exs[0]['label_candidates']))]
-        y = []
+        answers = []
+        y = None
         max_seq_len = self.learning_to_rank_config['max_sequence_length']
         for observation_i in exs:
             context_turns_i = list(map(self.parse, observation_i['text'].split('\n')))
-            context_turns_i = pad_sequences(context_turns_i,
-                                            maxlen=max_seq_len) 
+            context_turns_i = pad_sequences(context_turns_i, maxlen=max_seq_len) 
             context_turns_i = pad_sequences([context_turns_i],
-                                             maxlen=len(context_turns),
-                                             value=np.zeros(max_seq_len))[0]
+                                            maxlen=len(context_turns),
+                                            value=np.zeros(max_seq_len))[0]
             for j, context_turn in enumerate(context_turns_i):
                 context_turns[j].append(context_turn)
             answers_i = list(map(self.parse, observation_i['label_candidates']))
-            answers_i = pad_sequences(answers_i,
-                                      maxlen=max_seq_len) 
-            answers_i = pad_sequences([answers_i],
-                                      maxlen=len(answers),  
-                                      value=np.zeros(max_seq_len))[0]
-            for j, answer in enumerate(answers_i):
-                answers[j].append(answer)
-            label = observation_i['labels'][0] \
-                if 'labels' in observation_i \
-                else observation_i['eval_labels'][0]
-            y.append(observation_i['label_candidates'].index(label))
-        X = list(map(np.array, context_turns + answers))
-        y = np.array(y)
+            answers_i = pad_sequences(answers_i, maxlen=max_seq_len) 
+            answers = answers_i
+            label = observation_i.get('labels', [None])[0]
+            if label is not None:
+                y = np.zeros((len(observation_i['label_candidates']), 1), dtype=np.float32)
+                y[observation_i['label_candidates'].index(label)][0] = 1.0
+
+        context_turns_final = [[] for _ in range(self.learning_to_rank_config['max_context_turns'])]
+        for answer in answers:
+            for i in range(len(context_turns_final)):
+                context_turns_final[i].append(context_turns[i][0])
+        X = list(map(np.array, context_turns_final + [answers]))
+        y = np.array(y) if y is not None else None
         return X, y, valid_inds
 
     def predict(self, xs, ys=None):
         """Produce a prediction from our model. Update the model using the
         targets if available.
         """
-        batchsize = self.opt['batchsize'] 
+        batchsize = xs[0].shape[0] 
 
-        if ys is not None:
-            # update the model based on the labels
-            loss = 0
-            # keep track of longest label we've ever seen
-            sample_weights = np.expand_dims(np.ones(ys.shape[0]), -1)
-            with tf.variable_scope('model', reuse=tf.AUTO_REUSE):
-                feed_dict = {X_i: batch_x_i for X_i, batch_x_i in zip(self.X, xs)}
-                feed_dict.update({self.y: ys, self.batch_sample_weight: np.ones((batchsize, 1))})
-                batch_pred, _, train_batch_loss = self.sess.run([self.pred, self.train_op, self.loss_op],
-                                                                feed_dict=feed_dict)
-            return np.argmax(batch_pred, axis=-1)
-        else:
-            # just produce a prediction without training the model
-            done = [False for _ in range(batchsize)]
-            total_done = 0
-            max_len = 0
+        loss = 0
+        feed_dict = {X_i: batch_x_i for X_i, batch_x_i in zip(self.X, xs)}
+        sample_weights = np.expand_dims(np.ones(batchsize), -1)
 
-            while(total_done < batchsize) and max_len < self.longest_label:
-                # keep producing tokens until we hit EOS or max length for each
-                # example in the batch
-                output, hn = self.decoder(xes, hn)
-                preds, scores = self.hidden_to_idx(output, drop=False)
-                xes = self.lt(preds.t())
-                max_len += 1
-                for b in range(batchsize):
-                    if not done[b]:
-                        # only add more tokens for examples that aren't done yet
-                        token = self.v2t(preds.data[b])
-                        if token == self.EOS:
-                            # if we produced EOS, we're done
-                            done[b] = True
-                            total_done += 1
-                        else:
-                            output_lines[b].append(token)
-
-        return output_lines
+        with tf.variable_scope('model', reuse=tf.AUTO_REUSE):
+            if ys is not None:
+                with tf.variable_scope('model', reuse=tf.AUTO_REUSE):
+                    feed_dict.update({self.y: ys, self.batch_sample_weight: np.ones((batchsize, 1))})
+                    batch_pred, _, train_batch_loss = self.sess.run([self.pred, self.train_op, self.loss_op],
+                                                                    feed_dict=feed_dict)
+            else:
+                batch_pred = self.sess.run(self.pred, feed_dict=feed_dict)
+        return np.argmax(batch_pred, axis=-2)
 
     def parse(self, text):
         """Convert string to token indices."""
@@ -172,6 +152,9 @@ class LearningToRankAgent(Agent):
             # recall what was said in that example
             prev_dialogue = self.observation['text']
             observation['text'] = prev_dialogue + '\n' + observation['text']
+            candidates_list = list(observation['label_candidates'])
+            random.shuffle(candidates_list)
+            observation['label_candidates'] = tuple(candidates_list)
         self.observation = observation
         self.episode_done = observation['episode_done']
         return observation
